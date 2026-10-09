@@ -36,6 +36,16 @@ parse_model <- function(model, backend, ...) {
   model
 }
 
+# parse Stan model code with stanli
+# @param model Stan model code
+# @return validated Stan model code
+.parse_model_stanli <- function(model, silent = 1, ...) {
+  require_package("stanli", version = stanli_min_version())
+  # stanli embeds stanc3, so this needs no toolchain and writes no files
+  stanli::stanli_check_syntax(model)
+  model
+}
+
 # parse model with a mock backend for testing
 .parse_model_mock <- function(model, silent = TRUE, parse_error = NULL,
                               parse_check = "rstan", ...) {
@@ -107,6 +117,23 @@ compile_model <- function(model, backend, ...) {
   eval_silent(
     do_call(cmdstanr::cmdstan_model, args),
     type = "message", try = TRUE, silent = silent >= 2
+  )
+}
+
+# prepare a Stan model for stanli
+# stanli has no separate compilation step: it lowers the model together with
+# its data when sampling starts. So the "compiled model" is the checked Stan
+# code plus the settings that sampling needs.
+# @param model Stan model code
+.compile_model_stanli <- function(model, threads, opencl, silent = 1, ...) {
+  require_package("stanli", version = stanli_min_version())
+  if (use_opencl(opencl)) {
+    stop2("OpenCL is not supported by backend 'stanli'.")
+  }
+  stanli::stanli_check_syntax(model)
+  structure(
+    list(code = model, args = list(...)),
+    class = "brms_stanli_model"
   )
 }
 
@@ -345,6 +372,115 @@ fit_model <- function(model, backend, ...) {
   out
 }
 
+# fit Stan model with stanli
+# @param model the output of .compile_model_stanli
+# @param sdata named list to be passed to Stan as data
+# @return a fitted Stan model, as a stanfit
+.fit_model_stanli <- function(model, sdata, algorithm, iter, warmup, thin,
+                              chains, cores, threads, opencl, init, exclude,
+                              seed, control, silent, future, ...) {
+
+  require_package("stanli", version = stanli_min_version())
+  # some input checks and housekeeping
+  if (!algorithm %in% "sampling") {
+    stop2("Algorithm '", algorithm, "' is not supported by backend 'stanli'.")
+  }
+  if (use_opencl(opencl)) {
+    stop2("OpenCL is not supported by backend 'stanli'.")
+  }
+  if (future) {
+    stop2("Argument 'future' is not supported by backend 'stanli'. ",
+          "Chains already run in parallel according to argument 'cores'.")
+  }
+  class(sdata) <- "list"
+  if (isNA(seed)) {
+    seed <- sample.int(.Machine$integer.max, 1)
+  }
+  threads_per_chain <- 1
+  if (use_threading(threads, force = TRUE)) {
+    threads_per_chain <- threads$threads
+  }
+
+  chains <- as_one_numeric(chains)
+  empty_model <- chains <= 0
+  if (empty_model) {
+    # fit the model with minimal amount of draws
+    chains <- 1
+    iter <- 2
+    warmup <- 1
+    thin <- 1
+    cores <- 1
+  }
+
+  model_args <- list(
+    code = model$code, data = sdata, seed = seed,
+    threads_per_chain = threads_per_chain
+  )
+  model_args[names(model$args)] <- model$args
+  stanli_model <- do_call(stanli::stanli_model, model_args)
+
+  args <- list(
+    model = stanli_model, chains = chains, seed = seed,
+    warmup = warmup, samples = iter - warmup, thin = thin,
+    parallel_chains = min(cores, chains),
+    threads_per_chain = threads_per_chain,
+    refresh = if (silent >= 1) 0 else max(iter %/% 10, 1)
+  )
+  # initial values: stanli starts from the unconstrained scale
+  if (is.null(init) || is_equal(init, "random")) {
+    # stanli's default: uniform(-2, 2) on the unconstrained scale
+  } else if (is_equal(init, "0") || is_equal(init, 0)) {
+    args$init_radius <- 0
+  } else if (is.numeric(init) && length(init) == 1L) {
+    args$init_radius <- init
+  } else {
+    if (is.character(init)) {
+      init <- get(init, mode = "function", envir = parent.frame())
+    }
+    if (is.function(init)) {
+      init_fun <- init
+      init <- lapply(seq_len(chains), function(i) {
+        if (length(formals(init_fun))) init_fun(i) else init_fun()
+      })
+    }
+    if (!is.list(init) || length(init) != chains) {
+      stop2("Argument 'init' must be \"random\", \"0\", a function, or a ",
+            "list with one named list of initial values per chain.")
+    }
+    # every parameter must be given: stanli has no partial initial values
+    args$init <- do_call(rbind, lapply(init, function(values) {
+      stanli::unconstrain(stanli_model, values)
+    }))
+  }
+  # sampler settings under the names rstan and brms use
+  if (!is.null(control$adapt_delta)) {
+    args$delta <- control$adapt_delta
+  }
+  if (!is.null(control$max_treedepth)) {
+    args$max_depth <- control$max_treedepth
+  }
+  unused <- setdiff(names(control), c("adapt_delta", "max_treedepth"))
+  if (length(unused)) {
+    warning2("The following 'control' settings are ignored by backend ",
+             "'stanli': ", collapse_comma(unused))
+  }
+  dots <- list(...)
+  args[names(dots)] <- dots
+
+  # do the actual sampling
+  if (silent < 2) {
+    message("Start sampling")
+  }
+  out <- do_call(stanli::sample_model, args)
+  out <- stanli::as_stanfit(out, exclude = as.character(unlist(exclude)))
+
+  if (empty_model) {
+    # allow correct updating of an 'empty' model
+    out@sim <- list()
+  }
+  out
+}
+
 # fit model with a mock backend for testing
 .fit_model_mock <- function(model, sdata, algorithm, iter, warmup, thin,
                             chains, cores, threads, opencl, init, exclude,
@@ -366,6 +502,12 @@ compiled_model <- function(x) {
     out <- rstan::get_stanmodel(x$fit)
   } else if (backend == "cmdstanr") {
     out <- attributes(x$fit)$CmdStanModel
+  } else if (backend == "stanli") {
+    # nothing is compiled; sampling again only needs the Stan code
+    out <- structure(
+      list(code = stancode(x), args = list()),
+      class = "brms_stanli_model"
+    )
   } else if (backend == "mock") {
     stop2("'compiled_model' is not supported in the mock backend.")
   }
@@ -391,6 +533,9 @@ needs_recompilation <- function(x) {
       exe_file <- model$exe_file()
       out <- !is.character(exe_file) || !file.exists(exe_file)
     }
+  } else if (backend == "stanli") {
+    # there is no executable that could be missing or out of date
+    out <- FALSE
   } else if (backend == "mock") {
     out <- FALSE
   }
@@ -432,6 +577,8 @@ recompile_model <- function(x, recompile = NULL) {
     x$fit@stanmodel <- new_model
   } else if (backend == "cmdstanr") {
     attributes(x$fit)$CmdStanModel <- new_model
+  } else if (backend == "stanli") {
+    # nothing to store: see compiled_model()
   } else if (backend == "mock") {
     stop2("'recompile_model' is not supported in the mock backend.")
   }
@@ -452,6 +599,15 @@ elapsed_time <- function(x) {
     )
     out$total <- out$warmup + out$sampling
     rownames(out) <- NULL
+  } else if (backend == "stanli") {
+    out <- rstan::get_elapsed_time(x$fit)
+    out <- data.frame(
+      chain_id = seq_len(nrow(out)),
+      warmup = out[, "warmup"],
+      sampling = out[, "sample"]
+    )
+    out$total <- out$warmup + out$sampling
+    rownames(out) <- NULL
   } else if (backend == "cmdstanr") {
     out <- attributes(x$fit)$metadata$time$chains
   } else if (backend == "mock") {
@@ -460,9 +616,15 @@ elapsed_time <- function(x) {
   out
 }
 
+# minimal version of stanli providing what the 'stanli' backend calls:
+# stanli_check_syntax() and the 'exclude' argument of as_stanfit()
+stanli_min_version <- function() {
+  "0.19.1.9000"
+}
+
 # supported Stan backends
 backend_choices <- function() {
-  c("rstan", "cmdstanr", "mock")
+  c("rstan", "cmdstanr", "stanli", "mock")
 }
 
 # supported Stan algorithms
