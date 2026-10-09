@@ -382,9 +382,6 @@ fit_model <- function(model, backend, ...) {
 
   require_package("stanli", version = stanli_min_version())
   # some input checks and housekeeping
-  if (!algorithm %in% "sampling") {
-    stop2("Algorithm '", algorithm, "' is not supported by backend 'stanli'.")
-  }
   if (use_opencl(opencl)) {
     stop2("OpenCL is not supported by backend 'stanli'.")
   }
@@ -404,7 +401,9 @@ fit_model <- function(model, backend, ...) {
   chains <- as_one_numeric(chains)
   empty_model <- chains <= 0
   if (empty_model) {
-    # fit the model with minimal amount of draws
+    # fit the model with minimal amount of draws; they are discarded below,
+    # so the cheapest algorithm will do
+    algorithm <- "sampling"
     chains <- 1
     iter <- 2
     warmup <- 1
@@ -419,13 +418,14 @@ fit_model <- function(model, backend, ...) {
   model_args[names(model$args)] <- model$args
   stanli_model <- do_call(stanli::stanli_model, model_args)
 
-  args <- list(
-    model = stanli_model, chains = chains, seed = seed,
-    warmup = warmup, samples = iter - warmup, thin = thin,
-    parallel_chains = min(cores, chains),
-    threads_per_chain = threads_per_chain,
-    refresh = if (silent >= 1) 0 else max(iter %/% 10, 1)
-  )
+  args <- list(model = stanli_model, seed = seed)
+  # number of starting points the algorithm takes: one per chain or path,
+  # or a single one
+  if (algorithm %in% c("sampling", "fixed_param", "pathfinder")) {
+    n_init <- chains
+  } else {
+    n_init <- 1
+  }
   # initial values: stanli starts from the unconstrained scale
   if (is.null(init) || is_equal(init, "random")) {
     # stanli's default: uniform(-2, 2) on the unconstrained scale
@@ -439,13 +439,14 @@ fit_model <- function(model, backend, ...) {
     }
     if (is.function(init)) {
       init_fun <- init
-      init <- lapply(seq_len(chains), function(i) {
+      init <- lapply(seq_len(n_init), function(i) {
         if (length(formals(init_fun))) init_fun(i) else init_fun()
       })
     }
-    if (!is.list(init) || length(init) != chains) {
+    if (!is.list(init) || length(init) != n_init) {
       stop2("Argument 'init' must be \"random\", \"0\", a function, or a ",
-            "list with one named list of initial values per chain.")
+            "list with one named list of initial values per chain. ",
+            "Algorithm '", algorithm, "' takes ", n_init, ".")
     }
     # parameters without an initial value start at random, as in rstan
     args$init <- do_call(rbind, lapply(seq_along(init), function(i) {
@@ -453,17 +454,42 @@ fit_model <- function(model, backend, ...) {
                           seed = seed + i)
     }))
   }
-  # sampler settings under the names rstan and brms use
-  if (!is.null(control$adapt_delta)) {
-    args$delta <- control$adapt_delta
-  }
-  if (!is.null(control$max_treedepth)) {
-    args$max_depth <- control$max_treedepth
-  }
-  unused <- setdiff(names(control), c("adapt_delta", "max_treedepth"))
-  if (length(unused)) {
-    warning2("The following 'control' settings are ignored by backend ",
-             "'stanli': ", collapse_comma(unused))
+
+  if (algorithm %in% c("sampling", "fixed_param")) {
+    c(args) <- list(
+      chains = chains, warmup = warmup, samples = iter - warmup, thin = thin,
+      parallel_chains = min(cores, chains),
+      threads_per_chain = threads_per_chain,
+      refresh = if (silent >= 1) 0 else max(iter %/% 10, 1),
+      fixed_param = algorithm == "fixed_param"
+    )
+    # sampler settings under the names rstan and brms use
+    if (!is.null(control$adapt_delta)) {
+      args$delta <- control$adapt_delta
+    }
+    if (!is.null(control$max_treedepth)) {
+      args$max_depth <- control$max_treedepth
+    }
+    unused <- setdiff(names(control), c("adapt_delta", "max_treedepth"))
+    if (length(unused)) {
+      warning2("The following 'control' settings are ignored by backend ",
+               "'stanli': ", collapse_comma(unused))
+    }
+    fit_fun <- stanli_fit_fun("sample_model", algorithm)
+  } else if (algorithm %in% c("fullrank", "meanfield")) {
+    c(args) <- nlist(iter, algorithm, refresh = if (silent >= 1) 0 else 1)
+    args[names(control)] <- control
+    fit_fun <- stanli_fit_fun("variational_model", algorithm)
+  } else if (algorithm %in% c("pathfinder")) {
+    c(args) <- list(num_paths = chains, refresh = if (silent >= 1) 0 else 100)
+    args[names(control)] <- control
+    fit_fun <- stanli_fit_fun("pathfinder_model", algorithm)
+  } else if (algorithm %in% c("laplace")) {
+    c(args) <- list(refresh = if (silent >= 1) 0 else 100)
+    args[names(control)] <- control
+    fit_fun <- stanli_fit_fun("laplace_model", algorithm)
+  } else {
+    stop2("Algorithm '", algorithm, "' is not supported.")
   }
   dots <- list(...)
   args[names(dots)] <- dots
@@ -472,7 +498,7 @@ fit_model <- function(model, backend, ...) {
   if (silent < 2) {
     message("Start sampling")
   }
-  out <- do_call(stanli::sample_model, args)
+  out <- do_call(fit_fun, args)
   out <- stanli::as_stanfit(out, exclude = as.character(unlist(exclude)))
 
   if (empty_model) {
@@ -480,6 +506,22 @@ fit_model <- function(model, backend, ...) {
     out@sim <- list()
   }
   out
+}
+
+# the stanli function that runs an algorithm
+# Algorithms other than NUTS came to stanli after the functions named in
+# stanli_min_version(), so their presence is checked rather than assumed.
+stanli_fit_fun <- function(name, algorithm) {
+  ns <- asNamespace("stanli")
+  available <- exists(name, envir = ns, inherits = FALSE)
+  if (available && algorithm == "fixed_param") {
+    available <- "fixed_param" %in% names(formals(get(name, envir = ns)))
+  }
+  if (!available) {
+    stop2("Algorithm '", algorithm, "' requires a more recent version of ",
+          "package 'stanli'.")
+  }
+  get(name, envir = ns)
 }
 
 # fit model with a mock backend for testing

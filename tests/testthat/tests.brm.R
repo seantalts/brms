@@ -225,13 +225,133 @@ test_that("log_prob-based methods need no compiler with the stanli backend", {
   expect_s3_class(suppressWarnings(loo(fit, moment_match = TRUE)), "loo")
 })
 
+test_that("the stanli backend runs the approximate algorithms", {
+  skip_if_no_stanli()
+  skip_if(!exists("variational_model", asNamespace("stanli")),
+          "this stanli has no algorithms other than sampling")
+  set.seed(1357)
+  dat <- data.frame(
+    y = rnorm(60), x = rnorm(60), g = rep(1:6, each = 10)
+  )
+  dat$y <- 0.5 + 0.8 * dat$x + dat$y
+  # NUTS, as the reference the approximations are compared with
+  ref <- brm(y ~ x + (1 | g), dat, backend = "stanli", chains = 2,
+             iter = 1000, seed = 1, silent = 2, refresh = 0)
+
+  for (algorithm in c("meanfield", "fullrank", "pathfinder", "laplace")) {
+    # Stan warns about approximations it finds unreliable (e.g., Pareto k)
+    fit <- suppressWarnings(brm(
+      y ~ x + (1 | g), dat, backend = "stanli", algorithm = algorithm,
+      seed = 1, silent = 2, refresh = 0
+    ))
+    expect_s3_class(fit, "brmsfit")
+    expect_equal(fit$algorithm, algorithm, info = algorithm)
+    expect_equal(fit$backend, "stanli")
+    # one chain of 1000 independent draws, as with backend 'cmdstanr'
+    expect_equal(nchains(fit), 1, info = algorithm)
+    expect_equal(ndraws(fit), 1000, info = algorithm)
+    expect_true(all(c("lp__", "lp_approx__") %in% variables(fit)),
+                info = algorithm)
+    expect_false(any(grepl("^z_1", variables(fit))))
+
+    smry <- suppressWarnings(summary(fit))
+    method <- if (algorithm %in% c("meanfield", "fullrank")) {
+      paste0("variational(", algorithm, ")")
+    } else {
+      paste0(algorithm, "(lbfgs)")
+    }
+    expect_equal(smry$sampler, method, info = algorithm)
+    expect_equal(smry$total_ndraws, 1000)
+    expect_output(print(smry), "Draws were sampled using", fixed = TRUE)
+    expect_equal(dim(posterior_predict(fit)), c(1000, 60))
+    expect_equal(dim(posterior_epred(fit)), c(1000, 60))
+    expect_equal(dim(log_lik(fit)), c(1000, 60))
+    draws <- as_draws_df(fit)
+    expect_equal(nrow(draws), 1000)
+    expect_true(all(c("b_Intercept", "b_x", "sd_g__Intercept", "sigma",
+                      "lp__", "lp_approx__") %in% names(draws)))
+    expect_s3_class(suppressWarnings(loo(fit)), "loo")
+    expect_equal(nrow(elapsed_time(fit)), 1)
+
+    # an approximation of the same posterior: within three posterior
+    # standard deviations of the NUTS estimate for the slope
+    expect_equal(
+      fixef(fit)["x", "Estimate"], fixef(ref)["x", "Estimate"],
+      tolerance = 3 * fixef(ref)["x", "Est.Error"], scale = 1,
+      info = algorithm
+    )
+    # there are no NUTS diagnostics
+    expect_error(nuts_params(fit))
+    # nothing is compiled, so nothing needs recompiling
+    expect_false(needs_recompilation(fit))
+  }
+
+  # algorithm specific arguments
+  fit <- suppressWarnings(brm(
+    y ~ x, dat, backend = "stanli", algorithm = "meanfield", iter = 3000,
+    seed = 2, silent = 2, refresh = 0, draws = 500, init = 0,
+    control = list(tol_rel_obj = 0.005)
+  ))
+  expect_equal(ndraws(fit), 500)
+  # 'chains' is the number of paths; without resampling all draws are kept
+  fit <- suppressWarnings(brm(
+    y ~ x, dat, backend = "stanli", algorithm = "pathfinder", chains = 2,
+    seed = 2, silent = 2, refresh = 0, single_path_draws = 300,
+    psis_resample = FALSE,
+    init = list(list(Intercept = 0, sigma = 1), list(sigma = 2))
+  ))
+  expect_equal(ndraws(fit), 600)
+  fit <- brm(y ~ x, dat, backend = "stanli", algorithm = "laplace",
+             seed = 2, silent = 2, refresh = 0, draws = 200,
+             init = list(list(sigma = 1)))
+  expect_equal(ndraws(fit), 200)
+  # updating keeps the algorithm
+  fit2 <- update(fit, newdata = dat[1:40, ], seed = 3, silent = 2,
+                 refresh = 0)
+  expect_equal(fit2$algorithm, "laplace")
+  expect_equal(nobs(fit2), 40)
+  expect_equal(ndraws(fit2), 200)
+  expect_error(
+    brm(y ~ x, dat, backend = "stanli", algorithm = "laplace", silent = 2,
+        refresh = 0, init = list(list(sigma = 1), list(sigma = 2))),
+    "Algorithm 'laplace' takes 1"
+  )
+  # as with backend 'cmdstanr', the posterior mode needs the Jacobian
+  expect_error(
+    brm(y ~ x, dat, backend = "stanli", algorithm = "laplace", silent = 2,
+        refresh = 0, jacobian = FALSE),
+    "jacobian = FALSE is unsupported"
+  )
+})
+
+test_that("the stanli backend runs fixed_param", {
+  skip_if_no_stanli()
+  skip_if(!"fixed_param" %in% names(formals(stanli::sample_model)),
+          "this stanli has no fixed_param sampler")
+  set.seed(2468)
+  dat <- data.frame(y = rnorm(30), x = rnorm(30))
+  inits <- replicate(2, list(Intercept = 1, b = array(0.5), sigma = 2),
+                     simplify = FALSE)
+  fit <- brm(y ~ x, dat, backend = "stanli", algorithm = "fixed_param",
+             chains = 2, iter = 300, warmup = 100, init = inits, seed = 1,
+             silent = 2, refresh = 0)
+  expect_equal(fit$algorithm, "fixed_param")
+  # there is no warmup to discard
+  expect_equal(ndraws(fit), 400)
+  draws <- as_draws_df(fit)
+  # the parameters stay where they started
+  expect_true(all(draws$b_x == 0.5))
+  expect_true(all(draws$sigma == 2))
+  expect_equal(summary(fit)$sampler, "sampling(Fixed_param)")
+  # predictions still vary
+  expect_equal(dim(posterior_predict(fit)), c(400, 30))
+  expect_true(sd(posterior_predict(fit)[, 1]) > 1)
+  expect_equal(nrow(elapsed_time(fit)), 2)
+})
+
 test_that("the stanli backend refuses what it does not support", {
   skip_if_no_stanli()
   dat <- data.frame(y = rnorm(10), x = rnorm(10))
-  expect_error(
-    brm(y ~ x, dat, backend = "stanli", algorithm = "meanfield", silent = 2),
-    "Algorithm 'meanfield' is not supported by backend 'stanli'"
-  )
   expect_error(
     brm(y ~ x, dat, backend = "stanli", opencl = opencl(c(0, 0)), silent = 2),
     "OpenCL is not supported by backend 'stanli'"

@@ -250,7 +250,8 @@ current \R session via the
 respectively. The \code{"stanli"} backend runs the model with the
 \pkg{stanli} package (\url{https://github.com/seantalts/stanli}), which
 needs no C++ toolchain and has no compilation step. It supports
-\code{algorithm = "sampling"} only.
+every \code{algorithm}; for \code{"laplace"} the mode is found with
+the Jacobian adjustment, which is the default of \pkg{cmdstanr} too.
 Additionally a \code{"mock"} backend is available to make
 testing \pkg{brms} and packages that depend on it easier.
 The \code{"mock"} backend does not actually do any fitting, it only checks
@@ -330,7 +331,9 @@ For \code{backend = "rstan"} the arguments are passed to
 For \code{backend = "cmdstanr"} the arguments are passed to the
 \code{cmdstanr::sample} or \code{cmdstanr::variational} method.
 For \code{backend = "stanli"} the arguments are passed to
-\code{stanli::sample_model}.}
+\code{stanli::sample_model}, \code{stanli::variational_model},
+\code{stanli::pathfinder_model} or \code{stanli::laplace_model},
+depending on \code{algorithm}.}
 }
 \value{
 An object of class \code{brmsfit}, which contains the posterior
