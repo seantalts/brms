@@ -183,14 +183,20 @@ test_that("the stanli backend handles sampler arguments", {
   expect_equal(control_params(fit)$adapt_delta, 0.9)
   expect_equal(control_params(fit)$max_treedepth, 8)
 
-  # complete initial values on the constrained scale, one list per chain
+  # initial values on the constrained scale, one list per chain; parameters
+  # that are left out start at random
   inits <- list(
     list(Intercept = 0, b = array(0.1), sigma = 1),
-    list(Intercept = 0.2, b = array(-0.1), sigma = 2)
+    list(sigma = 2)
   )
   fit <- brm(y ~ x, dat, backend = "stanli", chains = 2, iter = 300,
              init = inits, seed = 1, silent = 2, refresh = 0)
   expect_equal(ndraws(fit), 300)
+  expect_error(
+    brm(y ~ x, dat, backend = "stanli", chains = 1, iter = 300,
+        init = list(list(sigma = -1)), silent = 2, refresh = 0),
+    "sigma"
+  )
 
   # an empty model can be created and sampled later
   empty <- brm(y ~ x, dat, backend = "stanli", chains = 0, silent = 2)

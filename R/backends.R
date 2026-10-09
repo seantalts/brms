@@ -447,9 +447,10 @@ fit_model <- function(model, backend, ...) {
       stop2("Argument 'init' must be \"random\", \"0\", a function, or a ",
             "list with one named list of initial values per chain.")
     }
-    # every parameter must be given: stanli has no partial initial values
-    args$init <- do_call(rbind, lapply(init, function(values) {
-      stanli::unconstrain(stanli_model, values)
+    # parameters without an initial value start at random, as in rstan
+    args$init <- do_call(rbind, lapply(seq_along(init), function(i) {
+      stanli::unconstrain(stanli_model, init[[i]], partial = TRUE,
+                          seed = seed + i)
     }))
   }
   # sampler settings under the names rstan and brms use
@@ -617,7 +618,8 @@ elapsed_time <- function(x) {
 }
 
 # minimal version of stanli providing what the 'stanli' backend calls:
-# stanli_check_syntax() and the 'exclude' argument of as_stanfit()
+# stanli_check_syntax(), the 'exclude' argument of as_stanfit(), and
+# partial initial values in unconstrain()
 stanli_min_version <- function() {
   "0.19.1.9000"
 }
