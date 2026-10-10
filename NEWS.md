@@ -3,8 +3,8 @@
 ### New Features
 
 * Fit models via the new `stanli` backend (`backend = "stanli"`), which runs
-Stan models without a C++ toolchain or a compilation step. It supports
-`algorithm = "sampling"`.
+Stan models without a C++ toolchain or a compilation step. All algorithms
+are available; `"pathfinder"` runs a single path.
 * Specify a prior `tag` for use in prior sensitivity analysis
 via `priorsense` thanks to Kallioinen. (#1585)
 * Specify group-level prior weights via argument `pw` in multilevel
