@@ -421,7 +421,7 @@ fit_model <- function(model, backend, ...) {
   args <- list(model = stanli_model, seed = seed)
   # number of starting points the algorithm takes: one per chain or path,
   # or a single one
-  if (algorithm %in% c("sampling", "fixed_param", "pathfinder")) {
+  if (algorithm %in% c("sampling", "fixed_param")) {
     n_init <- chains
   } else {
     n_init <- 1
@@ -481,7 +481,15 @@ fit_model <- function(model, backend, ...) {
     args[names(control)] <- control
     fit_fun <- stanli_fit_fun("variational_model", algorithm)
   } else if (algorithm %in% c("pathfinder")) {
-    c(args) <- list(num_paths = chains, refresh = if (silent >= 1) 0 else 100)
+    # stanli runs single-path Pathfinder only: the multi-path service of
+    # the Stan version it builds on reads past the end of an array
+    if (chains > 1) {
+      message(
+        "Backend 'stanli' runs single-path Pathfinder only. ",
+        "Running 1 path instead of ", chains, "."
+      )
+    }
+    c(args) <- list(num_paths = 1, refresh = if (silent >= 1) 0 else 100)
     args[names(control)] <- control
     fit_fun <- stanli_fit_fun("pathfinder_model", algorithm)
   } else if (algorithm %in% c("laplace")) {

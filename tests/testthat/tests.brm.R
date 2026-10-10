@@ -239,11 +239,12 @@ test_that("the stanli backend runs the approximate algorithms", {
              iter = 1000, seed = 1, silent = 2, refresh = 0)
 
   for (algorithm in c("meanfield", "fullrank", "pathfinder", "laplace")) {
-    # Stan warns about approximations it finds unreliable (e.g., Pareto k)
-    fit <- suppressWarnings(brm(
+    # ADVI warns when it stops at its iteration limit, and pathfinder
+    # announces that it runs a single path
+    fit <- suppressMessages(suppressWarnings(brm(
       y ~ x + (1 | g), dat, backend = "stanli", algorithm = algorithm,
       seed = 1, silent = 2, refresh = 0
-    ))
+    )))
     expect_s3_class(fit, "brmsfit")
     expect_equal(fit$algorithm, algorithm, info = algorithm)
     expect_equal(fit$backend, "stanli")
@@ -293,14 +294,31 @@ test_that("the stanli backend runs the approximate algorithms", {
     control = list(tol_rel_obj = 0.005)
   ))
   expect_equal(ndraws(fit), 500)
-  # 'chains' is the number of paths; without resampling all draws are kept
-  fit <- suppressWarnings(brm(
-    y ~ x, dat, backend = "stanli", algorithm = "pathfinder", chains = 2,
-    seed = 2, silent = 2, refresh = 0, single_path_draws = 300,
-    psis_resample = FALSE,
-    init = list(list(Intercept = 0, sigma = 1), list(sigma = 2))
-  ))
-  expect_equal(ndraws(fit), 600)
+  # pathfinder runs a single path whatever 'chains' is, and says so
+  expect_message(
+    fit <- brm(y ~ x, dat, backend = "stanli", algorithm = "pathfinder",
+               chains = 4, seed = 2, silent = 2, refresh = 0, draws = 300,
+               init = list(list(Intercept = 0, sigma = 1))),
+    "single-path Pathfinder only. Running 1 path instead of 4"
+  )
+  expect_equal(ndraws(fit), 300)
+  expect_equal(nchains(fit), 1)
+  expect_message(
+    fit1 <- brm(y ~ x, dat, backend = "stanli", algorithm = "pathfinder",
+                chains = 1, seed = 2, silent = 2, refresh = 0, draws = 300,
+                init = list(list(Intercept = 0, sigma = 1))),
+    NA
+  )
+  # the number of chains does not change the result
+  expect_equal(fixef(fit1), fixef(fit))
+  # asking stanli itself for several paths is an error
+  expect_error(
+    suppressMessages(brm(
+      y ~ x, dat, backend = "stanli", algorithm = "pathfinder", silent = 2,
+      refresh = 0, num_paths = 4
+    )),
+    "multi-path Pathfinder is not available"
+  )
   fit <- brm(y ~ x, dat, backend = "stanli", algorithm = "laplace",
              seed = 2, silent = 2, refresh = 0, draws = 200,
              init = list(list(sigma = 1)))
